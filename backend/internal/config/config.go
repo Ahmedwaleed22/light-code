@@ -1,25 +1,41 @@
 package config
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 type Config struct {
 	HTTPAddr      string
 	WorkspaceRoot string
 	FrontendDist  string
+	// AllowedOrigins lists extra host patterns (e.g. "*.example.com") allowed to open the socket.
+	// Same-origin connections are always allowed.
+	AllowedOrigins []string
 }
 
 func Load() Config {
-	addr := os.Getenv("HTTP_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:8080"
+	return Config{
+		HTTPAddr:       env("HTTP_ADDR", "127.0.0.1:8080"),
+		WorkspaceRoot:  env("WORKSPACE_ROOT", "../data/workspace"),
+		FrontendDist:   env("FRONTEND_DIST", "../frontend/dist"),
+		AllowedOrigins: list(os.Getenv("ALLOWED_ORIGINS")),
 	}
-	root := os.Getenv("WORKSPACE_ROOT")
-	if root == "" {
-		root = "../data/workspace"
+}
+
+func env(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
 	}
-	dist := os.Getenv("FRONTEND_DIST")
-	if dist == "" {
-		dist = "../frontend/dist"
+	return fallback
+}
+
+func list(value string) []string {
+	var items []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
 	}
-	return Config{HTTPAddr: addr, WorkspaceRoot: root, FrontendDist: dist}
+	return items
 }

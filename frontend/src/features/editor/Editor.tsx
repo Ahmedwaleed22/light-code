@@ -1,23 +1,27 @@
-import type { JSX } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { saveTab, type Tab } from './state';
+import { activeTab, createView, keepMine, takeServer } from './state';
 
-export function Editor({ tab }: { tab: Tab }) {
-  const ref = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => { ref.current?.focus(); }, [tab]);
-  function onKeyDown(event: JSX.TargetedKeyboardEvent<HTMLTextAreaElement>) {
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
-      event.preventDefault(); void saveTab(tab);
-    }
-    if (event.key === 'Tab') {
-      event.preventDefault();
-      const target = event.currentTarget;
-      const start = target.selectionStart;
-      const end = target.selectionEnd;
-      tab.content.value = tab.content.value.slice(0, start) + '  ' + tab.content.value.slice(end);
-      requestAnimationFrame(() => { target.selectionStart = target.selectionEnd = start + 2; });
-    }
+// A single CodeMirror view is created once; tabs swap their state into it.
+export function Editor() {
+  const host = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const view = createView(host.current!);
+    return () => view.destroy();
+  }, []);
+  return <div class="editor-host" ref={host} />;
+}
+
+export function ConflictBar() {
+  const tab = activeTab.value;
+  if (!tab) return null;
+  const status = tab.status.value;
+  if (status === 'conflict') {
+    return <div class="notice-bar warning" role="alert">
+      <span>This file changed on the server since you began editing.</span>
+      <button onClick={() => void takeServer(tab)}>Use Server Version</button>
+      <button onClick={() => void keepMine(tab)}>Overwrite with Mine</button>
+    </div>;
   }
-  return <textarea ref={ref} class="editor-input" aria-label={`Edit ${tab.path}`} spellcheck={false}
-    value={tab.content} onInput={(event) => { tab.content.value = event.currentTarget.value; }} onKeyDown={onKeyDown} />;
+  if (status === 'error' && tab.error) return <div class="notice-bar error" role="alert"><span>{tab.error}</span></div>;
+  return null;
 }
