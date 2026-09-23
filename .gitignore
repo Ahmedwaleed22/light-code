@@ -1,0 +1,11 @@
+node_modules/
+frontend/dist/
+.env
+.env.*
+!.env.example
+*.log
+backend/bin/
+.tools/
+*.tsbuildinfo
+data/workspace/*
+!data/workspace/README.md
