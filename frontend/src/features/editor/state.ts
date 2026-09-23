@@ -288,17 +288,26 @@ export function applyDelete(path: string) {
   }
 }
 
-on('files.saved', (change: Change) => {
-  const tab = find(change.path);
-  if (!tab || tab.version === change.version) return;
-  if (isDirty(tab) || tab.saving) fail(tab, 'conflict', '');
-  else void refreshClean(tab).catch(() => {});
-});
-on('files.renamed', (change: Change) => applyRename(change.oldPath!, change.path));
-on('files.deleted', (change: Change) => applyDelete(change.path));
-onReconnect(() => {
-  for (const tab of tabs.value) if (!isDirty(tab)) void refreshClean(tab).catch(() => {});
-});
+export function watchEditorChanges() {
+  const stop = [on('files.saved', (change: Change) => {
+    const tab = find(change.path);
+    if (!tab || tab.version === change.version) return;
+    if (isDirty(tab) || tab.saving) fail(tab, 'conflict', '');
+    else void refreshClean(tab).catch(() => {});
+  }), on('files.renamed', (change: Change) => applyRename(change.oldPath!, change.path)),
+  on('files.deleted', (change: Change) => applyDelete(change.path)), onReconnect(() => {
+    for (const tab of tabs.value) if (!isDirty(tab)) void refreshClean(tab).catch(() => {});
+  })];
+  // Persist drafts when the page is hidden, since it may be frozen or discarded next.
+  const onVisibilityChange = () => {
+    if (document.visibilityState === 'hidden') for (const tab of tabs.peek()) writeDraft(tab);
+  };
+  document.addEventListener('visibilitychange', onVisibilityChange);
+  return () => {
+    stop.forEach((unsubscribe) => unsubscribe());
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+  };
+}
 
 // ---- Session ------------------------------------------------------------------------------
 
@@ -315,8 +324,3 @@ export async function restoreTabs() {
   activate(active?.path ?? null);
   effect(() => saveSession({ tabs: tabs.value.map((tab) => tab.path), active: activePath.value }));
 }
-
-// Persist drafts right away when the page is hidden, since it may be frozen or discarded next.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') for (const tab of tabs.peek()) writeDraft(tab);
-});

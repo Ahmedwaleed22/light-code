@@ -140,7 +140,10 @@ function moved(from: string, to: string) {
   reopen.forEach((dir) => void loadDir(dir));
 }
 
-on('files.created', (change: Change) => { if (children.value.has(parentOf(change.path))) void loadDir(parentOf(change.path)); });
-on('files.deleted', (change: Change) => gone(change.path));
-on('files.renamed', (change: Change) => moved(change.oldPath!, change.path));
-onReconnect(() => void refreshTree());
+export function watchExplorerChanges() {
+  const stop = [on('files.created', (change: Change) => { if (children.value.has(parentOf(change.path))) void loadDir(parentOf(change.path)); }),
+    on('files.deleted', (change: Change) => gone(change.path)),
+    on('files.renamed', (change: Change) => moved(change.oldPath!, change.path)),
+    onReconnect(() => void refreshTree())];
+  return () => stop.forEach((unsubscribe) => unsubscribe());
+}

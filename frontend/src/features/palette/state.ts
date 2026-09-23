@@ -14,9 +14,10 @@ export function files() {
   return index;
 }
 const invalidate = () => { index = null; };
-on('files.created', invalidate);
-on('files.deleted', invalidate);
-on('files.renamed', invalidate);
+export function watchFileIndexChanges() {
+  const stop = [on('files.created', invalidate), on('files.deleted', invalidate), on('files.renamed', invalidate)];
+  return () => stop.forEach((unsubscribe) => unsubscribe());
+}
 
 // Subsequence match favouring consecutive characters and the file name over the directory.
 export function score(path: string, query: string): number {

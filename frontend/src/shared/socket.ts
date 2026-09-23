@@ -182,9 +182,15 @@ export function request<T = unknown>(op: string, args?: unknown, signal?: AbortS
 
 export function on(event: string, listener: (data: any) => void) {
   if (!listeners.has(event)) listeners.set(event, new Set());
-  listeners.get(event)!.add(listener);
+  const subscribers = listeners.get(event)!;
+  subscribers.add(listener);
+  return () => {
+    subscribers.delete(listener);
+    if (subscribers.size === 0) listeners.delete(event);
+  };
 }
 
 export function onReconnect(hook: () => void) {
   reconnectHooks.add(hook);
+  return () => { reconnectHooks.delete(hook); };
 }
