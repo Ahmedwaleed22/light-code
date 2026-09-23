@@ -1,19 +1,10 @@
-import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { bracketMatching, foldGutter, foldKeymap, indentOnInput, indentUnit } from '@codemirror/language';
-import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search';
-import { Annotation, Compartment, EditorSelection, EditorState, type TransactionSpec } from '@codemirror/state';
-import {
-  crosshairCursor, drawSelection, dropCursor, EditorView, highlightActiveLine, highlightActiveLineGutter,
-  highlightSpecialChars, keymap, lineNumbers, rectangularSelection,
-} from '@codemirror/view';
+import type { EditorState } from '@codemirror/state';
 import { computed, effect, signal, type Signal } from '@preact/signals';
 import { allDrafts, deleteDraft, putDraft, type Draft } from '../../shared/drafts';
 import { loadSession, saveSession } from '../../shared/session';
 import { on, onReconnect, RpcError } from '../../shared/socket';
 import { baseName, isWithin, readFile, saveFile, type Change } from '../workspace/api';
-import { languageFor } from './languages';
-import { darkPlus } from './theme';
+import { EditorSurface } from './surface';
 
 export type SaveStatus = 'saved' | 'modified' | 'saving' | 'conflict' | 'error';
 
@@ -43,75 +34,30 @@ export const cursor = signal({ line: 1, col: 1, selected: 0 });
 export const autoSave = signal(loadSession().autoSave);
 export const notice = signal('');
 
-const remote = Annotation.define<boolean>();
-const language = new Compartment();
-let view: EditorView | null = null;
 let nextTabId = 1;
 
 const isDirty = (tab: Tab) => tab.changeSeq !== tab.savedSeq;
 const find = (path: string) => tabs.value.find((tab) => tab.path === path);
 
-const extensions = [
-  lineNumbers(), highlightActiveLineGutter(), highlightSpecialChars(), history(), foldGutter(), drawSelection(),
-  dropCursor(), EditorState.allowMultipleSelections.of(true), indentOnInput(), bracketMatching(), closeBrackets(),
-  rectangularSelection(), crosshairCursor(), highlightActiveLine(), highlightSelectionMatches(), search({ top: true }),
-  indentUnit.of('  '), EditorState.tabSize.of(2), darkPlus,
-  keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, indentWithTab]),
-  EditorView.updateListener.of((update) => {
-    const tab = activeTab.peek();
-    if (!tab) return;
-    tab.state = update.state;
-    if (update.selectionSet || update.docChanged) {
-      const head = update.state.selection.main.head;
-      const line = update.state.doc.lineAt(head);
-      const selected = update.state.selection.ranges.reduce((sum, range) => sum + range.to - range.from, 0);
-      cursor.value = { line: line.number, col: head - line.from + 1, selected };
-    }
-    if (update.docChanged && !update.transactions.some((tr) => tr.annotation(remote))) changed(tab);
-  }),
-];
+const surface = new EditorSurface<Tab>(() => activeTab.peek(), changed, (next) => { cursor.value = next; });
 
 export function createView(parent: HTMLElement) {
-  view = new EditorView({ parent, state: EditorState.create({ extensions }) });
-  const tab = activeTab.peek();
-  if (tab) view.setState(tab.state);
-  return view;
+  return surface.createView(parent);
 }
 
 function newTab(path: string, content: string, version: string): Tab {
   const tab: Tab = {
-    id: nextTabId++, path, version, state: EditorState.create({ doc: content, extensions: [extensions, language.of([])] }),
+    id: nextTabId++, path, version, state: surface.createState(content),
     status: signal('saved'), error: '', changeSeq: 0, savedSeq: 0, saving: false, scrollTop: 0,
   };
-  const lang = languageFor(path);
-  lang.load?.().then((support) => update(tab, { effects: language.reconfigure(support) }), () => {});
+  surface.configureLanguage(tab);
   return tab;
-}
-
-// Applies a transaction to a tab whether or not it is the one currently shown.
-function update(tab: Tab, spec: TransactionSpec) {
-  if (view && activeTab.peek() === tab) view.dispatch(spec);
-  else tab.state = tab.state.update(spec).state;
-}
-
-function show(tab: Tab | null) {
-  if (!view) return;
-  const previous = tabs.peek().find((item) => item.state === view!.state);
-  if (previous) previous.scrollTop = view.scrollDOM.scrollTop;
-  view.setState(tab?.state ?? EditorState.create({ extensions }));
-  if (!tab) return;
-  const top = tab.scrollTop;
-  view.requestMeasure({ read: () => {}, write: (_, v) => { v.scrollDOM.scrollTop = top; } });
-  const head = tab.state.selection.main.head;
-  const line = tab.state.doc.lineAt(head);
-  cursor.value = { line: line.number, col: head - line.from + 1, selected: 0 };
-  view.focus();
 }
 
 export function activate(path: string | null) {
   if (activePath.peek() === path) return;
   activePath.value = path;
-  show(activeTab.peek());
+  surface.show(activeTab.peek(), tabs.peek());
 }
 
 // ---- Opening and closing ----------------------------------------------------------------
@@ -151,11 +97,7 @@ export async function openFile(path: string, line?: number) {
     if (!find(path)) tabs.value = [...tabs.value, tab];
   }
   activate(path);
-  if (line && view && activeTab.peek() === tab) {
-    const target = tab.state.doc.line(Math.min(line, tab.state.doc.lines));
-    view.dispatch({ selection: EditorSelection.cursor(target.from), effects: EditorView.scrollIntoView(target.from, { y: 'center' }) });
-    view.focus();
-  }
+  if (line) surface.scrollToLine(tab, line);
 }
 
 export function closeTab(path: string) {
@@ -240,7 +182,7 @@ export function toggleAutoSave() {
 
 // Replaces a tab's text with the server copy as one undoable step, without marking it modified.
 function replace(tab: Tab, content: string, version: string) {
-  update(tab, { changes: { from: 0, to: tab.state.doc.length, insert: content }, annotations: remote.of(true) });
+  surface.replaceContent(tab, content);
   tab.version = version;
   tab.savedSeq = tab.changeSeq;
   tab.error = '';
