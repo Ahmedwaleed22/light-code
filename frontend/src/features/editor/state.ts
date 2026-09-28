@@ -1,268 +1,464 @@
-import type { EditorState } from '@codemirror/state';
-import { computed, effect, signal, type Signal } from '@preact/signals';
-import { allDrafts, deleteDraft, putDraft, type Draft } from '../../shared/drafts';
-import { loadSession, saveSession } from '../../shared/session';
-import { on, onReconnect, RpcError } from '../../shared/socket';
-import { baseName, isWithin, readFile, saveFile, type Change } from '../workspace/api';
-import { EditorSurface } from './surface';
+import { computed, signal, type Signal } from '@preact/signals';
 
-export type SaveStatus = 'saved' | 'modified' | 'saving' | 'conflict' | 'error';
+import {
+  createFile,
+  createDirectory,
+  listFiles,
+  readFile,
+  saveFile,
+  type Entry
+} from './api';
 
-// A tab owns its EditorState, so switching tabs keeps undo history and selection with no network work.
 export type Tab = {
-  id: number;
   path: string;
-  state: EditorState;
+  content: Signal<string>;
+  savedContent: Signal<string>;
   version: string;
-  status: Signal<SaveStatus>;
-  error: string;
-  changeSeq: number;
-  savedSeq: number;
-  saving: boolean;
-  saveTimer?: ReturnType<typeof setTimeout>;
-  draftTimer?: ReturnType<typeof setTimeout>;
-  scrollTop: number;
+  saving: Signal<boolean>;
 };
 
-const AUTO_SAVE_DELAY = 750;
-const DRAFT_DELAY = 300;
-
+export const entries = signal<Entry[]>([]);
 export const tabs = signal<Tab[]>([]);
 export const activePath = signal<string | null>(null);
-export const activeTab = computed(() => tabs.value.find((tab) => tab.path === activePath.value) ?? null);
-export const cursor = signal({ line: 1, col: 1, selected: 0 });
-export const autoSave = signal(loadSession().autoSave);
-export const notice = signal('');
 
-let nextTabId = 1;
+export const activeTab = computed(
+  () =>
+    tabs.value.find(
+      (tab) => tab.path === activePath.value
+    ) ?? null
+);
 
-const isDirty = (tab: Tab) => tab.changeSeq !== tab.savedSeq;
-const find = (path: string) => tabs.value.find((tab) => tab.path === path);
+export const message = signal('');
 
-const surface = new EditorSurface<Tab>(() => activeTab.peek(), changed, (next) => { cursor.value = next; });
-
-export function createView(parent: HTMLElement) {
-  return surface.createView(parent);
-}
-
-function newTab(path: string, content: string, version: string): Tab {
-  const tab: Tab = {
-    id: nextTabId++, path, version, state: surface.createState(content),
-    status: signal('saved'), error: '', changeSeq: 0, savedSeq: 0, saving: false, scrollTop: 0,
-  };
-  surface.configureLanguage(tab);
-  return tab;
-}
-
-export function activate(path: string | null) {
-  if (activePath.peek() === path) return;
-  activePath.value = path;
-  surface.show(activeTab.peek(), tabs.peek());
-}
-
-// ---- Opening and closing ----------------------------------------------------------------
-
-const opening = new Map<string, Promise<Tab | null>>();
-
-async function load(path: string, draft?: Draft): Promise<Tab | null> {
-  let doc;
+export async function refreshFiles() {
   try {
-    doc = await readFile(path);
+    entries.value = await listFiles();
   } catch (error) {
-    if (!draft) { notice.value = `Cannot open ${path}: ${(error as Error).message}`; return null; }
-    const tab = newTab(path, draft.content, draft.baseVersion);
-    tab.changeSeq = 1;
-    fail(tab, 'error', 'The file no longer exists on the server. Your unsaved text is kept here.');
-    return tab;
+    message.value = String(error);
   }
-  if (!draft || draft.content === doc.content) {
-    if (draft) void deleteDraft(path).catch(() => {});
-    return newTab(path, doc.content, doc.version);
-  }
-  // Restore unsaved work from before a reload, crash, or discarded tab.
-  const tab = newTab(path, draft.content, doc.version);
-  tab.changeSeq = 1;
-  if (draft.baseVersion !== doc.version) fail(tab, 'conflict', '');
-  else { tab.status.value = 'modified'; if (autoSave.value) scheduleSave(tab); }
-  return tab;
 }
 
-export async function openFile(path: string, line?: number) {
-  let tab = find(path);
-  if (!tab) {
-    if (!opening.has(path)) opening.set(path, load(path).finally(() => opening.delete(path)));
-    const loaded = await opening.get(path)!;
-    if (!loaded) return;
-    tab = find(path) ?? loaded;
-    if (!find(path)) tabs.value = [...tabs.value, tab];
+export async function openFile(path: string) {
+  const existingTab = tabs.value.find(
+    (tab) => tab.path === path
+  );
+
+  if (existingTab) {
+    activePath.value = path;
+    message.value = '';
+    return;
   }
-  activate(path);
-  if (line) surface.scrollToLine(tab, line);
+
+  try {
+    const doc = await readFile(path);
+
+    tabs.value = [
+      ...tabs.value,
+      {
+        path,
+        content: signal(doc.content),
+        savedContent: signal(doc.content),
+        version: doc.version,
+        saving: signal(false)
+      }
+    ];
+
+    activePath.value = path;
+    message.value = '';
+  } catch (error) {
+    message.value = String(error);
+  }
 }
 
 export function closeTab(path: string) {
-  const tab = find(path);
-  if (!tab) return;
-  if (isDirty(tab)) {
-    if (autoSave.value && tab.status.value !== 'conflict' && tab.status.value !== 'error') void save(tab);
-    else if (confirm(`Discard unsaved changes to ${baseName(path)}?`)) void deleteDraft(path).catch(() => {});
-    else return;
+  const tab = tabs.value.find(
+    (item) => item.path === path
+  );
+
+  if (
+    tab &&
+    tab.content.value !== tab.savedContent.value &&
+    !window.confirm(
+      `Discard unsaved changes to ${path}?`
+    )
+  ) {
+    return;
   }
-  clearTimeout(tab.saveTimer);
-  const index = tabs.value.indexOf(tab);
-  tabs.value = tabs.value.filter((item) => item !== tab);
-  if (activePath.peek() === path) activate(tabs.value[Math.min(index, tabs.value.length - 1)]?.path ?? null);
+
+  const index = tabs.value.findIndex(
+    (item) => item.path === path
+  );
+
+  tabs.value = tabs.value.filter(
+    (item) => item.path !== path
+  );
+
+  if (activePath.value === path) {
+    activePath.value =
+      tabs.value[
+        Math.max(0, index - 1)
+      ]?.path ?? null;
+  }
+
+  message.value = '';
 }
 
-export function closeAll() {
-  for (const tab of [...tabs.value]) closeTab(tab.path);
-}
+export async function saveTab(tab: Tab) {
+  if (tab.saving.value) {
+    return;
+  }
 
-// ---- Saving -------------------------------------------------------------------------------
+  if (
+    tab.content.value ===
+    tab.savedContent.value
+  ) {
+    message.value = `Saved ${tab.path}`;
+    return;
+  }
 
-function changed(tab: Tab) {
-  tab.changeSeq++;
-  if (tab.status.value === 'saved' || tab.status.value === 'error') tab.status.value = 'modified';
-  clearTimeout(tab.draftTimer);
-  tab.draftTimer = setTimeout(() => writeDraft(tab), DRAFT_DELAY);
-  if (autoSave.value && tab.status.value !== 'conflict') scheduleSave(tab);
-}
+  tab.saving.value = true;
 
-function writeDraft(tab: Tab) {
-  clearTimeout(tab.draftTimer);
-  if (!isDirty(tab)) return;
-  putDraft({ path: tab.path, content: tab.state.doc.toString(), baseVersion: tab.version })
-    .catch(() => { notice.value = 'Browser storage is unavailable: unsaved changes will not survive a reload.'; });
-}
+  const content =
+    tab.content.value;
 
-function scheduleSave(tab: Tab) {
-  clearTimeout(tab.saveTimer);
-  tab.saveTimer = setTimeout(() => void save(tab), AUTO_SAVE_DELAY);
-}
-
-function fail(tab: Tab, status: 'conflict' | 'error', message: string) {
-  tab.error = message;
-  tab.status.value = status;
-}
-
-export async function save(tab: Tab) {
-  clearTimeout(tab.saveTimer);
-  if (tab.saving || !isDirty(tab) || tab.status.value === 'conflict') return;
-  tab.saving = true;
-  tab.status.value = 'saving';
-  const seq = tab.changeSeq;
   try {
-    // Waits in the socket queue while offline and is sent on reconnect.
-    const result = await saveFile(tab.path, tab.state.doc.toString(), tab.version);
-    tab.version = result.version;
-    tab.savedSeq = seq;
-    if (!isDirty(tab)) {
-      clearTimeout(tab.draftTimer);
-      tab.status.value = 'saved';
-      void deleteDraft(tab.path).catch(() => {});
-    } else tab.status.value = 'modified';
+    const doc = await saveFile({
+      path: tab.path,
+      content,
+      version: tab.version
+    });
+
+    tab.version = doc.version;
+    tab.savedContent.value = content;
+
+    message.value =
+      `Saved ${tab.path}`;
   } catch (error) {
-    if (error instanceof RpcError && error.code === 'conflict') fail(tab, 'conflict', '');
-    else fail(tab, 'error', (error as Error).message);
+    message.value =
+      `Could not save ${tab.path}: ${String(error)}`;
   } finally {
-    tab.saving = false;
-  }
-  if (tab.status.value === 'modified' && autoSave.value) scheduleSave(tab);
-}
-
-export function saveAll() {
-  for (const tab of tabs.value) void save(tab);
-}
-
-export function toggleAutoSave() {
-  autoSave.value = !autoSave.value;
-  saveSession({ autoSave: autoSave.value });
-  if (autoSave.value) saveAll();
-}
-
-// Replaces a tab's text with the server copy as one undoable step, without marking it modified.
-function replace(tab: Tab, content: string, version: string) {
-  surface.replaceContent(tab, content);
-  tab.version = version;
-  tab.savedSeq = tab.changeSeq;
-  tab.error = '';
-  tab.status.value = 'saved';
-  void deleteDraft(tab.path).catch(() => {});
-}
-
-export async function keepMine(tab: Tab) {
-  const server = await readFile(tab.path);
-  tab.version = server.version;
-  tab.status.value = 'modified';
-  await save(tab);
-}
-
-export async function takeServer(tab: Tab) {
-  const server = await readFile(tab.path);
-  replace(tab, server.content, server.version);
-}
-
-// ---- Changes made elsewhere -------------------------------------------------------------
-
-async function refreshClean(tab: Tab) {
-  const server = await readFile(tab.path);
-  if (server.version !== tab.version && !isDirty(tab) && !tab.saving) replace(tab, server.content, server.version);
-}
-
-export function applyRename(from: string, to: string) {
-  let moved = false;
-  for (const tab of tabs.value) {
-    if (!isWithin(tab.path, from)) continue;
-    const old = tab.path;
-    tab.path = to + old.slice(from.length);
-    moved = true;
-    if (activePath.peek() === old) activePath.value = tab.path;
-    if (isDirty(tab)) { void deleteDraft(old).catch(() => {}); writeDraft(tab); }
-  }
-  if (moved) tabs.value = [...tabs.value];
-}
-
-export function applyDelete(path: string) {
-  for (const tab of tabs.value) {
-    if (!isWithin(tab.path, path)) continue;
-    if (isDirty(tab)) fail(tab, 'error', 'This file was deleted. Your unsaved text is kept here.');
-    else closeTab(tab.path);
+    tab.saving.value = false;
   }
 }
 
-export function watchEditorChanges() {
-  const stop = [on('files.saved', (change: Change) => {
-    const tab = find(change.path);
-    if (!tab || tab.version === change.version) return;
-    if (isDirty(tab) || tab.saving) fail(tab, 'conflict', '');
-    else void refreshClean(tab).catch(() => {});
-  }), on('files.renamed', (change: Change) => applyRename(change.oldPath!, change.path)),
-  on('files.deleted', (change: Change) => applyDelete(change.path)), onReconnect(() => {
-    for (const tab of tabs.value) if (!isDirty(tab)) void refreshClean(tab).catch(() => {});
-  })];
-  // Persist drafts when the page is hidden, since it may be frozen or discarded next.
-  const onVisibilityChange = () => {
-    if (document.visibilityState === 'hidden') for (const tab of tabs.peek()) writeDraft(tab);
-  };
-  document.addEventListener('visibilitychange', onVisibilityChange);
-  return () => {
-    stop.forEach((unsubscribe) => unsubscribe());
-    document.removeEventListener('visibilitychange', onVisibilityChange);
-  };
+export async function saveAsTab(
+  tab: Tab,
+  newPath: string
+) {
+  const path = newPath.trim();
+
+  if (!path) {
+    return;
+  }
+
+  if (path === tab.path) {
+    await saveTab(tab);
+    return;
+  }
+
+  const existing = entries.value.find(
+    (entry) =>
+      entry.path.toLowerCase() ===
+      path.toLowerCase()
+  );
+
+  if (existing) {
+    message.value =
+      `A file named "${path}" already exists.`;
+
+    return;
+  }
+
+  try {
+    await createFile(path);
+
+    const newDoc =
+      await readFile(path);
+
+    const saved =
+      await saveFile({
+        path,
+        content: tab.content.value,
+        version: newDoc.version
+      });
+
+    const newTab: Tab = {
+      path,
+      content: signal(
+        tab.content.value
+      ),
+      savedContent: signal(
+        tab.content.value
+      ),
+      version: saved.version,
+      saving: signal(false)
+    };
+
+    tabs.value = [
+      ...tabs.value,
+      newTab
+    ];
+
+    activePath.value = path;
+
+    await refreshFiles();
+
+    message.value =
+      `Saved as ${path}`;
+  } catch (error) {
+    message.value =
+      `Could not save as ${path}: ${String(error)}`;
+
+    await refreshFiles();
+  }
 }
 
-// ---- Session ------------------------------------------------------------------------------
+export async function newFile(
+  filePath?: string
+) {
+  const path = (
+    filePath ??
+    window.prompt(
+      'New file path (relative to workspace):'
+    )
+  )?.trim();
 
-export async function restoreTabs() {
-  const session = loadSession();
-  let drafts: Draft[] = [];
-  try { drafts = await allDrafts(); }
-  catch { notice.value = 'Browser storage is unavailable: unsaved changes will not survive a reload.'; }
-  const paths = [...new Set([...session.tabs, ...drafts.map((draft) => draft.path)])];
-  const loaded = await Promise.all(paths.map((path) => load(path, drafts.find((draft) => draft.path === path))));
-  tabs.value = loaded.filter((tab): tab is Tab => tab !== null);
-  const active = find(session.active ?? '') ?? tabs.value[0] ?? null;
-  activePath.value = null;
-  activate(active?.path ?? null);
-  effect(() => saveSession({ tabs: tabs.value.map((tab) => tab.path), active: activePath.value }));
+  if (!path) {
+    return;
+  }
+
+  try {
+    const existing = entries.value.find(
+      (entry) =>
+        entry.path.toLowerCase() ===
+        path.toLowerCase()
+    );
+
+    if (existing) {
+      message.value =
+        `A file or folder named "${path}" already exists.`;
+
+      return;
+    }
+
+    await createFile(path);
+
+    await refreshFiles();
+
+    await openFile(path);
+
+    message.value =
+      `Created ${path}`;
+  } catch (error) {
+    message.value = String(error);
+
+    await refreshFiles();
+  }
+}
+
+export async function newFolder(
+  folderPath?: string
+) {
+  const path = (
+    folderPath ??
+    window.prompt(
+      'New folder path (relative to workspace):'
+    )
+  )?.trim();
+
+  if (!path) {
+    return;
+  }
+
+  try {
+    const existing = entries.value.find(
+      (entry) =>
+        entry.path.toLowerCase() ===
+        path.toLowerCase()
+    );
+
+    if (existing) {
+      message.value =
+        `A file or folder named "${path}" already exists.`;
+
+      return;
+    }
+
+    await createDirectory(path);
+
+    await refreshFiles();
+
+    message.value =
+      `Created folder ${path}`;
+  } catch (error) {
+    message.value = String(error);
+
+    await refreshFiles();
+  }
+}
+
+export async function importLocalFiles(
+  files: File[]
+) {
+  if (files.length === 0) {
+    return;
+  }
+
+  try {
+    const existing = new Map(
+      entries.value.map(
+        (entry) => [
+          entry.path,
+          entry.kind
+        ]
+      )
+    );
+
+    const directories =
+      new Set<string>();
+
+    const imports: Array<{
+      path: string;
+      content: string;
+    }> = [];
+
+    for (const file of files) {
+      const relativePath =
+        (
+          file as File & {
+            webkitRelativePath?: string;
+          }
+        ).webkitRelativePath ||
+        file.name;
+
+      const path =
+        relativePath
+          .replace(/\\/g, '/')
+          .replace(/^\/+/, '');
+
+      const parts =
+        path.split('/');
+
+      if (
+        parts.some(
+          (part) =>
+            !part ||
+            part === '.' ||
+            part === '..'
+        )
+      ) {
+        continue;
+      }
+
+      for (
+        let index = 1;
+        index < parts.length;
+        index += 1
+      ) {
+        directories.add(
+          parts
+            .slice(0, index)
+            .join('/')
+        );
+      }
+
+      if (
+        file.size >
+        2 * 1024 * 1024
+      ) {
+        throw new Error(
+          `${path} exceeds the 2 MiB file limit.`
+        );
+      }
+
+      imports.push({
+        path,
+        content:
+          await file.text()
+      });
+    }
+
+    for (
+      const directory of [
+        ...directories
+      ].sort(
+        (a, b) =>
+          a.split('/').length -
+          b.split('/').length
+      )
+    ) {
+      if (!existing.has(directory)) {
+        await createDirectory(
+          directory
+        );
+
+        existing.set(
+          directory,
+          'directory'
+        );
+      }
+    }
+
+    let imported = 0;
+
+    for (
+      const file of imports
+    ) {
+      if (
+        existing.has(file.path)
+      ) {
+        continue;
+      }
+
+      await createFile(
+        file.path
+      );
+
+      const doc =
+        await readFile(
+          file.path
+        );
+
+      await saveFile({
+        ...doc,
+        content:
+          file.content
+      });
+
+      existing.set(
+        file.path,
+        'file'
+      );
+
+      imported += 1;
+    }
+
+    await refreshFiles();
+
+    const firstImported =
+      imports.find(
+        (file) =>
+          existing.get(
+            file.path
+          ) === 'file'
+      );
+
+    if (firstImported) {
+      await openFile(
+        firstImported.path
+      );
+    }
+
+    message.value =
+      `Imported ${imported} file${
+        imported === 1
+          ? ''
+          : 's'
+      } into the workspace`;
+  } catch (error) {
+    message.value =
+      `Could not import files: ${String(error)}`;
+
+    await refreshFiles();
+  }
 }
